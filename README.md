@@ -1,81 +1,152 @@
-# DeepSeek Harness in Docker
+# DeepSeek Harness (remote Web UI)
 
-Web UI from the published `@deepseek-ai/dsh` npm package, reachable from another PC on the LAN. Model access is an OpenAI-compatible gateway configured via `.env` before start (not via Settings).
+Packaging around the published npm package `@deepseek-ai/dsh`: bind on `0.0.0.0`, OpenAI-compatible LLM (vLLM), trusted-host for LAN/remote browsers, and optional plugins (auth-gate, docs, sidebar, …).
 
-## Prerequisites
+**Primary path:** bare-metal install script on Ubuntu/Linux (`scripts/install-and-run-dsh.sh`).  
+**Secondary:** Docker Compose (see below).
 
-- Docker Desktop with Compose
-- A reachable OpenAI-compatible endpoint (`/v1/chat/completions`)
-- LAN IP of this Windows machine (for the other PC's browser)
+## Prerequisites (script)
 
-## Setup
+- Node.js 22.19+ or 24+
+- `git` (for GitHub-hosted plugins)
+- Root or passwordless `sudo` for systemd (`dsh-web`); otherwise the script falls back to `nohup`
+- Reachable OpenAI-compatible gateway (`…/v1`, not `…/v1/models`)
 
-1. Copy the env template and fill it in:
+## Quick start (Ubuntu server)
 
-```powershell
-Copy-Item .env.example .env
+```bash
+cd /opt/deepseek-harness-docker   # or clone this repo
+git pull
+./scripts/install-and-run-dsh.sh
 ```
 
-| Variable | Required | Meaning |
+The script:
+
+1. Detects whether `dsh-web` is already running (systemd / nohup pid / port).
+2. Installs `@deepseek-ai/dsh`, writes cordis overlays (bind `0.0.0.0`, LLM, auth-gate).
+3. Installs plugins into profile `web`.
+4. Stops the old process if needed, then starts/restarts the service.
+5. Reuses `DSH_AUTH_TOKEN` from `~/dsh-app/config/dsh.env` on re-runs (does not invalidate logins).
+
+Open UI: `http://<DSH_TRUSTED_HOST>:3000`  
+First visit: use the `?token=` URL from logs; then log in with the shared **auth-gate** token printed by the script.
+
+```bash
+systemctl status dsh-web
+journalctl -u dsh-web -f
+```
+
+### Service control
+
+| Action | Command |
+|---|---|
+| Full install / update + restart | `./scripts/install-and-run-dsh.sh` |
+| Status only | `DSH_ACTION=status ./scripts/install-and-run-dsh.sh` |
+| Stop | `DSH_ACTION=stop ./scripts/install-and-run-dsh.sh` |
+| Restart (no reinstall) | `DSH_ACTION=restart ./scripts/install-and-run-dsh.sh` |
+| Update config/plugins but leave process up | `DSH_RESTART=0 ./scripts/install-and-run-dsh.sh` |
+| Foreground (debug) | `DSH_FOREGROUND=1 ./scripts/install-and-run-dsh.sh` |
+
+Or: `systemctl stop|start|restart dsh-web`.
+
+### Environment overrides
+
+| Variable | Default | Meaning |
 |---|---|---|
-| `DSH_LLM_BASE_URL` | yes | Gateway base URL (usually ends with `/v1`) |
-| `DSH_LLM_API_KEY` | yes | Gateway API key |
-| `DSH_MODEL` | yes | Model id sent on the wire |
-| `DSH_TRUSTED_HOST` | yes | Host as typed in the other PC's browser (e.g. `192.168.1.50`, no `http://`) |
-| `WORKSPACE_PATH` | yes | Host folder mounted as `/workspace` |
+| `DSH_VERSION` | `0.1.2-rc.1` | npm `@deepseek-ai/dsh` version |
+| `DSH_PORT` | `3000` | listen port |
+| `DSH_HOME` | `~/.dsh` | profiles / sessions |
+| `DSH_WORKSPACE` | `~/workspace` | agent working directory |
+| `DSH_INSTALL_DIR` | `~/dsh-app` | config, unit, logs, pid |
+| `DSH_LLM_BASE_URL` | `http://77.50.132.85:8111/v1` | gateway base (`/v1`) |
+| `DSH_MODEL` | `Inferact/Qwen3.8-27B-NVFP4` | model id |
+| `DSH_LLM_API_KEY` | `sk-local` | gateway key |
+| `DSH_CONTEXT_WINDOW` | `16384` | must match server `max_model_len` |
+| `DSH_MAX_TOKENS` | `8192` | must be **&lt;** context window |
+| `DSH_TRUSTED_HOST` | auto / LAN IP | Host as typed in the browser (no `http://`) |
+| `DSH_AUTH_TOKEN` | reused or generated | shared login for `dsh-auth-gate` |
+| `DSH_SERVICE_NAME` | `dsh-web` | systemd unit name |
+| `DSH_SKIP_PLUGINS` | `0` | `1` = skip plugin installs |
+| `DSH_PLUGINS_STRICT` | `0` | `1` = fail if any plugin fails |
+| `DSH_RESTART` | `1` | `0` = do not stop/start if already running |
+| `DSH_ACTION` | `install` | `install` \| `status` \| `stop` \| `restart` |
 
-2. Start:
+Example:
 
-```powershell
-docker compose up -d --build
+```bash
+DSH_LLM_BASE_URL=http://127.0.0.1:8111/v1 \
+DSH_MODEL=Inferact/Qwen3.8-27B-NVFP4 \
+DSH_TRUSTED_HOST=77.50.132.85 \
+./scripts/install-and-run-dsh.sh
 ```
 
-3. Open the UI:
+### Plugins (profile `web`)
 
-- This PC: [http://localhost:3080](http://localhost:3080)
-- Other PC: `http://<DSH_TRUSTED_HOST>:3080`
+Installed by default:
 
-4. Choose workspace → `/workspace`.
+| Name | Package |
+|---|---|
+| dsh-document | `@jiaoqsh/dsh-document` |
+| dsh-auth-gate | `dsh-auth-gate` |
+| dsh-docs | `dsh-doc` |
+| dsh-open-file | `dsh-open-file` |
+| dsh-chat-files | `github:xzyonline/dsh-file-attachments` |
+| DSH-better-sidebar | `dsh-better-sidebar` |
 
-## Model configuration
+Auth-gate runs in **token** mode over plain HTTP (`cookieSecure: false`). The login token is stored in `$DSH_INSTALL_DIR/config/dsh.env` (mode `600`).
 
-The container disables the native DeepSeek adapter and mounts `llm-pi-ai` with one route (`docker-gateway`, protocol `openai-completions`). New sessions use `DSH_MODEL` by default.
+### LLM token limits
 
-The API key is **runtime-only** (`environment` from `.env`). It is not passed as a Docker build arg, so it does not appear in image layers.
+If the gateway returns HTTP 400 about context length, lower `DSH_CONTEXT_WINDOW` / `DSH_MAX_TOKENS` so they fit the server’s `max_model_len` (script default assumes 16384).
 
-To change URL, key, or model: edit `.env`, then:
+## Trusted host and Settings
 
-```powershell
-docker compose up -d --build
-```
+`dsh` rejects CLI `--host 0.0.0.0`; the script binds via a cordis `--patch` (must appear **before** `--port` / `--trusted-host`).
 
-## LAN and trusted host
+`/api` requires `--trusted-host` to match the browser `Host`. A mismatch shows the UI shell with API `403`.
 
-`dsh` rejects `--host 0.0.0.0` on the CLI. This stack binds `0.0.0.0` through a cordis overlay and publishes port `3080`.
-
-Requests to `/api` must present a loopback `Host` or an authority listed in `--trusted-host`. Set `DSH_TRUSTED_HOST` to exactly what the remote browser uses (IP or hostname). A mismatch yields UI shell with API `403`.
-
-## Settings from another PC
-
-Settings, credential writes, and the native directory picker are loopback-only. From another PC you **cannot** save an API key in the Models page — that is why the gateway is configured via `.env`. Workspace selection uses the in-app browser against paths inside the container (start with `/workspace`).
+Settings / credential writes are **loopback-only**. From another PC you cannot save models in Settings — use the script overlays / env instead.
 
 ## Security
 
-There is **no Web UI authentication**. Anyone who can open `http://LAN_IP:3080` can run the agent and execute commands inside the container.
+- Prefer **auth-gate** (`DSH_AUTH_TOKEN`) when exposing beyond localhost.
+- Do not publish the port to the open internet without additional controls (TLS reverse proxy, firewall).
+- Keep `dsh.env` private; it holds the API key and auth token.
+- There is still no strong multi-user isolation inside one `dsh` process.
 
-- Do not publish port 3080 to the internet or forward it on the router.
-- Restrict Windows Firewall inbound TCP 3080 to the LAN.
-- Keep `.env` out of git (already in `.gitignore`).
-- Prefer a `WORKSPACE_PATH` outside OneDrive; OneDrive binds under Docker Desktop are often slow and break file watchers.
+## Docker (optional)
 
-## Data
+```powershell
+Copy-Item .env.example .env
+# edit DSH_LLM_*, DSH_TRUSTED_HOST, WORKSPACE_PATH
+docker compose up -d --build
+```
 
-- Named volume `dsh-home` → `$DSH_HOME` (`/data/dsh`): profiles, sessions, local settings.
-- Bind mount `WORKSPACE_PATH` → `/workspace`: project files the agent may read and edit.
-
-## Stop / logs
+- This PC: http://localhost:3080  
+- Other PC: `http://<DSH_TRUSTED_HOST>:3080`  
+- Workspace inside container: `/workspace`
 
 ```powershell
 docker compose logs -f dsh
 docker compose down
 ```
+
+The API key is runtime-only from `.env` (not a build arg).
+
+## Layout
+
+| Path | Role |
+|---|---|
+| `scripts/install-and-run-dsh.sh` | install, plugins, systemd/nohup lifecycle |
+| `docker-compose.yml` / `Dockerfile` | optional container stack |
+| `docker/webserver.cordis.yml` | bind `0.0.0.0` for Docker |
+| `.env.example` | Docker env template |
+
+On the server after script install:
+
+| Path | Role |
+|---|---|
+| `~/dsh-app/config/dsh.env` | runtime env + `DSH_AUTH_TOKEN` |
+| `~/dsh-app/config/*.cordis.yml` | overlays |
+| `~/.dsh` | profiles, plugins, sessions |
+| `/etc/systemd/system/dsh-web.service` | unit (when systemd is used) |
