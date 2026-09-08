@@ -22,6 +22,7 @@
 #   DSH_AUTH_TOKEN=...                 # shared login for dsh-auth-gate (reused from dsh.env if empty)
 #   DSH_SKIP_PLUGINS=1                 # skip plugin installation
 #   DSH_PLUGINS_STRICT=1               # fail the script if any plugin install fails
+#   DSH_FORCE=1                        # reinstall dsh/plugins even if already present
 #   DSH_RESTART=1                      # 1=restart if already running (default); 0=leave running after update
 #   DSH_ACTION=install|status|stop|restart  # default install (full update+start)
 
@@ -46,9 +47,11 @@ DSH_SERVICE_NAME="${DSH_SERVICE_NAME:-dsh-web}"
 DSH_FOREGROUND="${DSH_FOREGROUND:-0}"
 DSH_SKIP_PLUGINS="${DSH_SKIP_PLUGINS:-0}"
 DSH_PLUGINS_STRICT="${DSH_PLUGINS_STRICT:-0}"
+DSH_FORCE="${DSH_FORCE:-0}"
 DSH_PROFILE="${DSH_PROFILE:-web}"
 DSH_RESTART="${DSH_RESTART:-1}"
 DSH_ACTION="${DSH_ACTION:-install}"
+CONFIG_CHANGED=0
 
 # npm / git install specs (user-facing names → real packages)
 # - dsh-document       → @jiaoqsh/dsh-document
@@ -75,6 +78,105 @@ UNIT_FILE="$CONFIG_DIR/${DSH_SERVICE_NAME}.service"
 PID_FILE="$DSH_INSTALL_DIR/dsh.pid"
 LOG_FILE="$DSH_INSTALL_DIR/logs/dsh.log"
 HOME_PATCH="$DSH_HOME/cordis.patch.yml"
+PROFILE_PKG="$DSH_HOME/profiles/$DSH_PROFILE/package.json"
+
+# Write stdin to $1 only when content differs. Sets CONFIG_CHANGED=1 on write.
+write_if_changed() {
+  local path="$1" tmp mode=""
+  tmp="$(mktemp)"
+  cat >"$tmp"
+  if [[ -f "$path" ]] && cmp -s "$tmp" "$path"; then
+    rm -f "$tmp"
+    info "unchanged $path"
+    return 1
+  fi
+  mkdir -p "$(dirname "$path")"
+  if [[ -f "$path" ]]; then
+    mode="$(stat -c '%a' "$path" 2>/dev/null || stat -f '%OLp' "$path" 2>/dev/null || true)"
+  fi
+  mv "$tmp" "$path"
+  if [[ -n "$mode" ]]; then
+    chmod "$mode" "$path" 2>/dev/null || true
+  fi
+  CONFIG_CHANGED=1
+  info "wrote $path"
+  return 0
+}
+
+dsh_installed_version() {
+  local bin ver
+  bin="$(command -v dsh 2>/dev/null || true)"
+  [[ -n "$bin" ]] || return 1
+  ver="$("$bin" --version 2>/dev/null | head -n1 || true)"
+  ver="${ver#v}"
+  # Prefer exact npm global version when available.
+  local npm_ver
+  npm_ver="$(npm list -g --depth=0 --json '@deepseek-ai/dsh' 2>/dev/null \
+    | python3 -c 'import json,sys
+try:
+ d=json.load(sys.stdin)
+ print(((d.get("dependencies") or {}).get("@deepseek-ai/dsh") or {}).get("version") or "")
+except Exception:
+ print("")' 2>/dev/null || true)"
+  if [[ -n "$npm_ver" ]]; then
+    printf '%s\n' "$npm_ver"
+    return 0
+  fi
+  [[ -n "$ver" ]] || return 1
+  # Strip trailing junk; keep first token that looks like a version.
+  printf '%s\n' "$ver" | grep -oE '[0-9][0-9A-Za-z._+-]*' | head -n1
+}
+
+plugin_spec_name() {
+  local spec="$1"
+  if [[ "$spec" == github:* ]]; then
+    local repo="${spec#github:}"
+    repo="${repo%%#*}"
+    printf '%s\n' "${repo##*/}"
+    return 0
+  fi
+  if [[ "$spec" == @* ]]; then
+    # @scope/name or @scope/name@version
+    printf '%s\n' "$(printf '%s' "$spec" | sed -E 's|^(@[^/]+/[^@]+).*|\1|')"
+    return 0
+  fi
+  printf '%s\n' "${spec%%@*}"
+}
+
+plugin_already_installed() {
+  local spec="$1"
+  local name
+  name="$(plugin_spec_name "$spec")"
+  [[ -f "$PROFILE_PKG" ]] || return 1
+  python3 - "$PROFILE_PKG" "$spec" "$name" <<'PY'
+import json, sys
+from pathlib import Path
+pkg_path, spec, name = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+data = json.loads(pkg_path.read_text(encoding="utf-8"))
+deps = data.get("dependencies") or {}
+bundles = ((data.get("dsh") or {}).get("profile") or {}).get("bundles") or []
+nm = pkg_path.parent / "node_modules" / name
+if name in deps and nm.exists():
+    raise SystemExit(0)
+# github:user/repo — match dependency value or node_modules dir
+if spec.startswith("github:"):
+    repo = spec.split(":", 1)[1].split("#", 1)[0]
+    for k, v in deps.items():
+        s = str(v)
+        if repo in s or name == k:
+            if (pkg_path.parent / "node_modules" / k).exists() or nm.exists():
+                raise SystemExit(0)
+    if name in bundles and nm.exists():
+        raise SystemExit(0)
+    raise SystemExit(1)
+if name in deps and (pkg_path.parent / "node_modules" / name).exists():
+    raise SystemExit(0)
+# Also accept present in bundles + node_modules even if version pin differs
+if name in bundles and nm.exists():
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
 
 if [[ -z "${DSH_TRUSTED_HOST:-}" ]]; then
   DSH_TRUSTED_HOST="$(hostname -I 2>/dev/null | awk '{print $1}')"
@@ -280,6 +382,7 @@ case "$DSH_ACTION" in
     [[ -n "$DSH_BIN" ]] || die "dsh not on PATH"
     # Jump to start section via flag
     DSH_ACTION_RESTART_ONLY=1
+    CONFIG_CHANGED=1
     ;;
   install) ;;
   *)
@@ -311,15 +414,35 @@ info "install_dir=$DSH_INSTALL_DIR"
 mkdir -p "$DSH_HOME" "$DSH_WORKSPACE" "$DSH_INSTALL_DIR" "$HOME/.npm-global" "$DSH_INSTALL_DIR/logs" "$DSH_HOME/auth" "$CONFIG_DIR"
 npm config set prefix "$HOME/.npm-global"
 export PATH="$HOME/.npm-global/bin:$PATH"
-if ! grep -q '.npm-global/bin' "$HOME/.bashrc" 2>/dev/null; then
+if [[ -f "$HOME/.bashrc" ]] && grep -q '.npm-global/bin' "$HOME/.bashrc" 2>/dev/null; then
+  info "PATH already includes ~/.npm-global/bin in ~/.bashrc"
+else
   echo 'export PATH="$HOME/.npm-global/bin:$PATH"' >> "$HOME/.bashrc"
+  info "appended npm-global PATH to ~/.bashrc"
 fi
 
 log "Step 3/9: install @deepseek-ai/dsh@${DSH_VERSION} and pnpm"
-npm install -g "@deepseek-ai/dsh@${DSH_VERSION}"
-if ! command -v pnpm >/dev/null 2>&1; then
-  info "installing pnpm (required by: dsh plugin)"
-  npm install -g pnpm
+INSTALLED_DSH_VER="$(dsh_installed_version || true)"
+if [[ "$DSH_FORCE" != "1" && -n "$INSTALLED_DSH_VER" && "$INSTALLED_DSH_VER" == "$DSH_VERSION" ]]; then
+  info "dsh@$INSTALLED_DSH_VER already installed — skip npm install -g"
+else
+  if [[ -n "$INSTALLED_DSH_VER" && "$INSTALLED_DSH_VER" != "$DSH_VERSION" ]]; then
+    info "dsh@$INSTALLED_DSH_VER present → upgrading to @$DSH_VERSION"
+  else
+    info "installing @deepseek-ai/dsh@$DSH_VERSION"
+  fi
+  npm install -g "@deepseek-ai/dsh@${DSH_VERSION}"
+fi
+if command -v pnpm >/dev/null 2>&1 && [[ "$DSH_FORCE" != "1" ]]; then
+  info "pnpm already present — skip"
+else
+  if ! command -v pnpm >/dev/null 2>&1; then
+    info "installing pnpm (required by: dsh plugin)"
+    npm install -g pnpm
+  elif [[ "$DSH_FORCE" == "1" ]]; then
+    info "DSH_FORCE=1 — reinstalling pnpm"
+    npm install -g pnpm
+  fi
 fi
 DSH_BIN="$(command -v dsh || true)"
 [[ -n "$DSH_BIN" ]] || die "dsh not on PATH after install"
@@ -336,16 +459,16 @@ if (( DSH_MAX_TOKENS >= DSH_CONTEXT_WINDOW )); then
   die "DSH_MAX_TOKENS ($DSH_MAX_TOKENS) must be smaller than DSH_CONTEXT_WINDOW ($DSH_CONTEXT_WINDOW)"
 fi
 
-log "Step 4/9: write cordis overlays"
-cat > "$WEBSERVER_PATCH" <<EOF
+log "Step 4/9: write cordis overlays (only if changed)"
+write_if_changed "$WEBSERVER_PATCH" <<EOF || true
 - id: webserver
   config:
     host: '0.0.0.0'
     port: !!js ctx.webStartup.port ?? ${DSH_PORT}
 EOF
-info "wrote $WEBSERVER_PATCH"
 
-python3 - "$LLM_PATCH" <<'PY'
+LLM_TMP="$(mktemp)"
+python3 - "$LLM_TMP" <<'PY'
 import os, sys
 path = sys.argv[1]
 base = os.environ["DSH_LLM_BASE_URL"]
@@ -417,10 +540,16 @@ overlay = [
 with open(path, "w", encoding="utf-8") as fh:
     yaml.safe_dump(overlay, fh, default_flow_style=False, allow_unicode=True, sort_keys=False)
 PY
-info "wrote $LLM_PATCH"
+if [[ -f "$LLM_PATCH" ]] && cmp -s "$LLM_TMP" "$LLM_PATCH"; then
+  info "unchanged $LLM_PATCH"
+  rm -f "$LLM_TMP"
+else
+  mv "$LLM_TMP" "$LLM_PATCH"
+  CONFIG_CHANGED=1
+  info "wrote $LLM_PATCH"
+fi
 
-# Plain HTTP deployment: cookieSecure must be false or the browser drops the auth cookie.
-cat > "$AUTH_PATCH" <<'EOF'
+write_if_changed "$AUTH_PATCH" <<'EOF' || true
 - id: dsh-auth-gate
   config:
     mode: token
@@ -428,15 +557,14 @@ cat > "$AUTH_PATCH" <<'EOF'
     cookieSecure: false
     sessionTtl: 604800
 EOF
-info "wrote $AUTH_PATCH (auth-gate over plain HTTP)"
 
 # Also keep a durable home-level override so auth-gate works even without --patch.
-python3 - "$HOME_PATCH" "$AUTH_PATCH" <<'PY'
+home_rc=0
+python3 - "$HOME_PATCH" "$AUTH_PATCH" <<'PY' || home_rc=$?
 import sys
 from pathlib import Path
 home_path = Path(sys.argv[1])
 auth_path = Path(sys.argv[2])
-auth_rows = []
 try:
     import yaml
     auth_rows = yaml.safe_load(auth_path.read_text(encoding="utf-8")) or []
@@ -447,11 +575,25 @@ try:
         existing = []
     kept = [row for row in existing if not (isinstance(row, dict) and row.get("id") == "dsh-auth-gate")]
     kept.extend(auth_rows)
-    home_path.write_text(yaml.safe_dump(kept, default_flow_style=False, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    new_text = yaml.safe_dump(kept, default_flow_style=False, allow_unicode=True, sort_keys=False)
+    old_text = home_path.read_text(encoding="utf-8") if home_path.exists() else None
+    if old_text == new_text:
+        raise SystemExit(2)
+    home_path.write_text(new_text, encoding="utf-8")
 except ImportError:
-    home_path.write_text(auth_path.read_text(encoding="utf-8"), encoding="utf-8")
+    text = auth_path.read_text(encoding="utf-8")
+    if home_path.exists() and home_path.read_text(encoding="utf-8") == text:
+        raise SystemExit(2)
+    home_path.write_text(text, encoding="utf-8")
 PY
-info "merged auth-gate into $HOME_PATCH"
+if [[ $home_rc -eq 2 ]]; then
+  info "unchanged $HOME_PATCH"
+elif [[ $home_rc -eq 0 ]]; then
+  CONFIG_CHANGED=1
+  info "merged auth-gate into $HOME_PATCH"
+else
+  die "failed to merge $HOME_PATCH"
+fi
 
 log "Step 5/9: probe LLM gateway"
 MODELS_URL="${DSH_LLM_BASE_URL%/}/models"
@@ -474,7 +616,7 @@ install_one_plugin() {
   printf '%s\n' "$out" | sed 's/^/      /'
   # pnpm may require allowing prepare/build scripts for git-hosted packages.
   if printf '%s\n' "$out" | grep -qiE 'allowBuilds|Ignored build scripts|pnpm.onlyBuiltDependencies'; then
-    local pkg_json="$DSH_HOME/profiles/$DSH_PROFILE/package.json"
+    local pkg_json="$PROFILE_PKG"
     warn "retrying $spec after enabling pnpm build scripts in profile"
     python3 - "$pkg_json" <<'PY'
 import json, sys
@@ -496,22 +638,36 @@ PY
 }
 
 PLUGIN_FAILED=()
+PLUGIN_SKIPPED=0
+PLUGIN_INSTALLED=0
 if [[ "$DSH_SKIP_PLUGINS" == "1" ]]; then
   warn "DSH_SKIP_PLUGINS=1 — skipping plugin installs"
 else
-  info "initializing profile '$DSH_PROFILE'"
-  "$DSH_BIN" --profile "$DSH_PROFILE" --dump-default-config >/dev/null
+  if [[ -f "$PROFILE_PKG" && "$DSH_FORCE" != "1" ]]; then
+    info "profile '$DSH_PROFILE' already exists — skip --dump-default-config"
+  else
+    info "initializing profile '$DSH_PROFILE'"
+    "$DSH_BIN" --profile "$DSH_PROFILE" --dump-default-config >/dev/null
+  fi
   for spec in "${DEFAULT_PLUGINS[@]}"; do
+    if [[ "$DSH_FORCE" != "1" ]] && plugin_already_installed "$spec"; then
+      info "already installed — skip $spec"
+      PLUGIN_SKIPPED=$((PLUGIN_SKIPPED + 1))
+      continue
+    fi
     if install_one_plugin "$spec"; then
       info "OK $spec"
+      PLUGIN_INSTALLED=$((PLUGIN_INSTALLED + 1))
+      CONFIG_CHANGED=1
     else
       warn "FAILED $spec"
       PLUGIN_FAILED+=("$spec")
     fi
   done
+  info "plugins: newly installed=$PLUGIN_INSTALLED skipped=$PLUGIN_SKIPPED failed=${#PLUGIN_FAILED[@]}"
   info "installed bundles in $DSH_HOME/profiles/$DSH_PROFILE:"
-  if [[ -f "$DSH_HOME/profiles/$DSH_PROFILE/package.json" ]]; then
-    python3 - "$DSH_HOME/profiles/$DSH_PROFILE/package.json" <<'PY' | sed 's/^/      /'
+  if [[ -f "$PROFILE_PKG" ]]; then
+    python3 - "$PROFILE_PKG" <<'PY' | sed 's/^/      /'
 import json, sys
 data = json.load(open(sys.argv[1], encoding="utf-8"))
 bundles = (data.get("dsh") or {}).get("profile") or {}
@@ -531,7 +687,8 @@ fi
 
 log "Step 7/9: write service env + unit"
 umask 077
-cat > "$ENV_FILE" <<EOF
+ENV_TMP="$(mktemp)"
+cat > "$ENV_TMP" <<EOF
 DSH_HOME=$DSH_HOME
 DSH_LLM_BASE_URL=$DSH_LLM_BASE_URL
 DSH_MODEL=$DSH_MODEL
@@ -542,13 +699,22 @@ DSH_MAX_TOKENS=$DSH_MAX_TOKENS
 DSH_AUTH_TOKEN=$DSH_AUTH_TOKEN
 PATH=$HOME/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 EOF
-chmod 600 "$ENV_FILE"
-info "wrote $ENV_FILE (mode 600)"
+if [[ -f "$ENV_FILE" ]] && cmp -s "$ENV_TMP" "$ENV_FILE"; then
+  info "unchanged $ENV_FILE"
+  rm -f "$ENV_TMP"
+else
+  mv "$ENV_TMP" "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
+  CONFIG_CHANGED=1
+  info "wrote $ENV_FILE (mode 600)"
+fi
+chmod 600 "$ENV_FILE" 2>/dev/null || true
 
 EXEC_START="$DSH_BIN web --patch $WEBSERVER_PATCH --patch $LLM_PATCH --patch $AUTH_PATCH --no-open --port $DSH_PORT --trusted-host $DSH_TRUSTED_HOST"
 SERVICE_USER="$(id -un)"
 SERVICE_GROUP="$(id -gn)"
-cat > "$UNIT_FILE" <<EOF
+UNIT_TMP="$(mktemp)"
+cat > "$UNIT_TMP" <<EOF
 [Unit]
 Description=DeepSeek Harness Web UI ($DSH_SERVICE_NAME)
 After=network-online.target
@@ -569,7 +735,14 @@ TimeoutStopSec=20
 [Install]
 WantedBy=multi-user.target
 EOF
-info "wrote $UNIT_FILE"
+if [[ -f "$UNIT_FILE" ]] && cmp -s "$UNIT_TMP" "$UNIT_FILE"; then
+  info "unchanged $UNIT_FILE"
+  rm -f "$UNIT_TMP"
+else
+  mv "$UNIT_TMP" "$UNIT_FILE"
+  CONFIG_CHANGED=1
+  info "wrote $UNIT_FILE"
+fi
 
 log "Step 8/9: summary"
 info "listen=0.0.0.0:${DSH_PORT}"
@@ -578,6 +751,7 @@ info "tokens: context=$DSH_CONTEXT_WINDOW max=$DSH_MAX_TOKENS"
 info "trusted-host=$DSH_TRUSTED_HOST"
 info "auth-gate token mode (DSH_AUTH_TOKEN length=${#DSH_AUTH_TOKEN})"
 info "save this login token: $DSH_AUTH_TOKEN"
+info "config_changed=$CONFIG_CHANGED (overlays/env/unit/plugins)"
 warn "Settings→Models still loopback-only; model comes from overlay"
 warn "open URL with dsh ?token= once (auth-gate can bridge it), then use login token/password"
 fi # end install (skipped when DSH_ACTION=restart)
@@ -666,6 +840,13 @@ start_service() {
   if [[ "$DSH_RESTART" != "1" && "$RUN_MODE" =~ ^(systemd|nohup|port)$ ]]; then
     warn "service already running ($RUN_DETAIL); DSH_RESTART=0 — leaving it up"
     warn "new plugins/overlays apply after: DSH_ACTION=restart $0"
+    info "auth shared token: $DSH_AUTH_TOKEN"
+    return 0
+  fi
+
+  if [[ "${CONFIG_CHANGED:-1}" == "0" && "$RUN_MODE" =~ ^(systemd|nohup)$ ]]; then
+    info "nothing changed and service already running — skip restart"
+    info "force restart: DSH_ACTION=restart $0   or   DSH_FORCE=1 $0"
     info "auth shared token: $DSH_AUTH_TOKEN"
     return 0
   fi

@@ -23,10 +23,11 @@ git pull
 The script:
 
 1. Detects whether `dsh-web` is already running (systemd / nohup pid / port).
-2. Installs `@deepseek-ai/dsh`, writes cordis overlays (bind `0.0.0.0`, LLM, auth-gate).
-3. Installs plugins into profile `web`.
-4. Stops the old process if needed, then starts/restarts the service.
-5. Reuses `DSH_AUTH_TOKEN` from `~/dsh-app/config/dsh.env` on re-runs (does not invalidate logins).
+2. Skips completed install steps when possible (matching `dsh` version, pnpm, plugins already in the profile, unchanged overlays/env/unit).
+3. Installs `@deepseek-ai/dsh` only if missing/wrong version; writes cordis overlays (bind `0.0.0.0`, LLM, auth-gate).
+4. Installs only missing plugins into profile `web`.
+5. Restarts the service only when config/plugins changed (or use `DSH_ACTION=restart` / `DSH_FORCE=1`).
+6. Reuses `DSH_AUTH_TOKEN` from `~/dsh-app/config/dsh.env` on re-runs (does not invalidate logins).
 
 Open UI: `http://<DSH_TRUSTED_HOST>:3000`  
 First visit: use the `?token=` URL from logs; then log in with the shared **auth-gate** token printed by the script.
@@ -68,6 +69,7 @@ Or: `systemctl stop|start|restart dsh-web`.
 | `DSH_SERVICE_NAME` | `dsh-web` | systemd unit name |
 | `DSH_SKIP_PLUGINS` | `0` | `1` = skip plugin installs |
 | `DSH_PLUGINS_STRICT` | `0` | `1` = fail if any plugin fails |
+| `DSH_FORCE` | `0` | `1` = reinstall dsh/pnpm/plugins even if already present |
 | `DSH_RESTART` | `1` | `0` = do not stop/start if already running |
 | `DSH_ACTION` | `install` | `install` \| `status` \| `stop` \| `restart` |
 
