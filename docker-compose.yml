@@ -1,0 +1,29 @@
+services:
+  dsh:
+    build:
+      context: .
+      args:
+        DSH_LLM_BASE_URL: ${DSH_LLM_BASE_URL}
+        DSH_MODEL: ${DSH_MODEL}
+    environment:
+      DSH_LLM_BASE_URL: ${DSH_LLM_BASE_URL}
+      DSH_LLM_API_KEY: ${DSH_LLM_API_KEY}
+      DSH_MODEL: ${DSH_MODEL}
+      DSH_TRUSTED_HOST: ${DSH_TRUSTED_HOST}
+      DSH_HOME: /data/dsh
+    ports:
+      - "3080:3080"
+    volumes:
+      - dsh-home:/data/dsh
+      - ${WORKSPACE_PATH}:/workspace
+    working_dir: /workspace
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3080').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+volumes:
+  dsh-home:

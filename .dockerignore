@@ -1,0 +1,9 @@
+deepseek-harness
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+README.md
+**/.DS_Store
+**/Thumbs.db

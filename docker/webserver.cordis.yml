@@ -1,0 +1,7 @@
+# Bind on all interfaces so Docker can publish the Web UI to the LAN.
+# The CLI rejects `--host 0.0.0.0`; this overlay sets the webserver row directly.
+# A patch replaces the whole config for a row, so host and port must both be set.
+- id: webserver
+  config:
+    host: '0.0.0.0'
+    port: !!js ctx.webStartup.port ?? 3080
