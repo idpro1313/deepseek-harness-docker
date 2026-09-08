@@ -3,7 +3,6 @@
 # against a local/remote OpenAI-compatible (vLLM) gateway.
 #
 # Usage:
-#   chmod +x install-and-run-dsh.sh
 #   ./install-and-run-dsh.sh
 #
 # Optional env overrides:
@@ -18,6 +17,11 @@
 #   DSH_INSTALL_DIR=~/dsh-app
 
 set -euo pipefail
+
+log()  { printf '==> %s\n' "$*"; }
+info() { printf '    %s\n' "$*"; }
+warn() { printf 'WARN: %s\n' "$*" >&2; }
+die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 DSH_VERSION="${DSH_VERSION:-0.1.2-rc.1}"
 DSH_PORT="${DSH_PORT:-3000}"
@@ -36,61 +40,74 @@ if [[ -z "${DSH_TRUSTED_HOST:-}" ]]; then
   fi
 fi
 
-echo "==> Node: $(node -v 2>/dev/null || true)"
+log "Step 1/7: check Node.js"
 if ! command -v node >/dev/null 2>&1; then
-  echo "ERROR: Node.js is required (22.19+ or 24+). Install it first." >&2
-  exit 1
+  die "Node.js is required (22.19+ or 24+). Install it first."
 fi
-
+info "node=$(command -v node)"
+info "version=$(node -v)"
+info "npm=$(npm -v 2>/dev/null || echo missing)"
 NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
 if [[ "$NODE_MAJOR" -lt 22 ]]; then
-  echo "ERROR: Node.js 22+ required, found $(node -v)" >&2
-  exit 1
+  die "Node.js 22+ required, found $(node -v)"
 fi
 
-echo "==> Install dirs"
+log "Step 2/7: prepare directories"
+info "DSH_HOME=$DSH_HOME"
+info "workspace=$DSH_WORKSPACE"
+info "install_dir=$DSH_INSTALL_DIR"
+info "npm_prefix=$HOME/.npm-global"
 mkdir -p "$DSH_HOME" "$DSH_WORKSPACE" "$DSH_INSTALL_DIR" "$HOME/.npm-global"
 npm config set prefix "$HOME/.npm-global"
 export PATH="$HOME/.npm-global/bin:$PATH"
+info "PATH starts with: $(echo "$PATH" | cut -d: -f1-3)"
 
-# Persist PATH for later shells
 if ! grep -q '.npm-global/bin' "$HOME/.bashrc" 2>/dev/null; then
+  info "appending npm-global bin to ~/.bashrc"
   echo 'export PATH="$HOME/.npm-global/bin:$PATH"' >> "$HOME/.bashrc"
+else
+  info "~/.bashrc already has npm-global PATH"
 fi
 
-echo "==> Installing @deepseek-ai/dsh@${DSH_VERSION} (user prefix, no sudo)"
+log "Step 3/7: install @deepseek-ai/dsh@${DSH_VERSION} (user prefix, no sudo)"
+info "npm install -g @deepseek-ai/dsh@${DSH_VERSION}"
 npm install -g "@deepseek-ai/dsh@${DSH_VERSION}"
-
 if ! command -v dsh >/dev/null 2>&1; then
-  echo "ERROR: dsh not on PATH after install. PATH=$PATH" >&2
-  exit 1
+  die "dsh not on PATH after install. PATH=$PATH"
 fi
-echo "    $(command -v dsh)"
+info "dsh binary: $(command -v dsh)"
+info "dsh version: $(dsh --version 2>/dev/null || true)"
+info "dsh web --help (launcher / app flags):"
+dsh web --help 2>&1 | sed 's/^/      /' || true
 
 CONFIG_DIR="$DSH_INSTALL_DIR/config"
 mkdir -p "$CONFIG_DIR"
+WEBSERVER_PATCH="$CONFIG_DIR/webserver.cordis.yml"
+LLM_PATCH="$CONFIG_DIR/llm.cordis.yml"
 
 export DSH_HOME DSH_LLM_BASE_URL DSH_MODEL DSH_LLM_API_KEY DSH_TRUSTED_HOST
 
+log "Step 4/7: write cordis overlays"
 # Bind all interfaces — CLI rejects --host 0.0.0.0, so patch the webserver row.
-cat > "$CONFIG_DIR/webserver.cordis.yml" <<EOF
+cat > "$WEBSERVER_PATCH" <<EOF
 - id: webserver
   config:
     host: '0.0.0.0'
     port: !!js ctx.webStartup.port ?? ${DSH_PORT}
 EOF
+info "wrote $WEBSERVER_PATCH"
+sed 's/^/      /' "$WEBSERVER_PATCH"
 
 # OpenAI-compatible vLLM route. baseURL must be .../v1 (NOT .../v1/models).
-# Quote model id — it contains '/'.
-python3 - "$CONFIG_DIR/llm.cordis.yml" <<'PY'
+python3 - "$LLM_PATCH" <<'PY'
 import os, sys
+path = sys.argv[1]
+base = os.environ["DSH_LLM_BASE_URL"]
+model = os.environ["DSH_MODEL"]
+
 try:
     import yaml
 except ImportError:
-    # Fallback without PyYAML: write carefully escaped YAML by hand.
-    path = sys.argv[1]
-    base = os.environ["DSH_LLM_BASE_URL"]
-    model = os.environ["DSH_MODEL"]
     def q(s: str) -> str:
         return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
     open(path, "w", encoding="utf-8").write(
@@ -117,7 +134,6 @@ except ImportError:
     )
     raise SystemExit(0)
 
-path = sys.argv[1]
 overlay = [
     {"id": "llm-deepseek", "disabled": True},
     {
@@ -128,47 +144,61 @@ overlay = [
                     "displayName": "vLLM gateway",
                     "apiKeyEnv": "DSH_LLM_API_KEY",
                     "api": "openai-completions",
-                    "baseURL": os.environ["DSH_LLM_BASE_URL"],
-                    "models": [
-                        {
-                            "id": os.environ["DSH_MODEL"],
-                            "name": os.environ["DSH_MODEL"],
-                        }
-                    ],
+                    "baseURL": base,
+                    "models": [{"id": model, "name": model}],
                 }
             }
         },
     },
     {
         "id": "agent-default-model",
-        "config": {
-            "provider": "docker-gateway",
-            "model": os.environ["DSH_MODEL"],
-        },
+        "config": {"provider": "docker-gateway", "model": model},
     },
 ]
 with open(path, "w", encoding="utf-8") as fh:
     yaml.safe_dump(overlay, fh, default_flow_style=False, allow_unicode=True, sort_keys=False)
 PY
+info "wrote $LLM_PATCH"
+sed 's/^/      /' "$LLM_PATCH"
 
-echo "==> Config"
-echo "    DSH_HOME=$DSH_HOME"
-echo "    workspace=$DSH_WORKSPACE"
-echo "    listen=0.0.0.0:${DSH_PORT}"
-echo "    LLM base=$DSH_LLM_BASE_URL"
-echo "    model=$DSH_MODEL"
-echo "    trusted-host=$DSH_TRUSTED_HOST"
-echo
-echo "WARNING: no real multi-user auth. Anyone who can open the URL and has the"
-echo "         ?token= from the log can run the agent on this machine."
-echo
-echo "==> Starting dsh (Ctrl+C to stop)"
-echo "    Open the printed URL that contains ?token=..."
-echo "    From another PC use host '$DSH_TRUSTED_HOST' (must match trusted-host)."
+log "Step 5/7: probe LLM gateway"
+MODELS_URL="${DSH_LLM_BASE_URL%/}/models"
+info "GET $MODELS_URL"
+if command -v curl >/dev/null 2>&1; then
+  if curl -fsS --max-time 10 "$MODELS_URL" | sed 's/^/      /'; then
+    info "LLM /models reachable"
+  else
+    warn "could not reach $MODELS_URL — dsh may fail on first chat"
+  fi
+else
+  warn "curl not installed; skip LLM probe"
+fi
+
+log "Step 6/7: summary"
+info "listen=0.0.0.0:${DSH_PORT}"
+info "LLM base=$DSH_LLM_BASE_URL"
+info "model=$DSH_MODEL"
+info "apiKeyEnv=DSH_LLM_API_KEY (value length=${#DSH_LLM_API_KEY})"
+info "trusted-host=$DSH_TRUSTED_HOST"
+info "working_directory=$DSH_WORKSPACE"
+warn "no real multi-user auth — anyone with the ?token= URL can run the agent"
+warn "open the printed URL with ?token=... ; host must match trusted-host"
+
+# IMPORTANT: launcher --patch flags MUST come before web-app flags (--port/--no-open/--trusted-host).
+# Otherwise commander pass-through treats --patch as an unknown app option.
+CMD=(
+  dsh web
+  --patch "$WEBSERVER_PATCH"
+  --patch "$LLM_PATCH"
+  --no-open
+  --port "$DSH_PORT"
+  --trusted-host "$DSH_TRUSTED_HOST"
+)
+
+log "Step 7/7: start dsh (Ctrl+C to stop)"
+info "cd $DSH_WORKSPACE"
+info "exec: ${CMD[*]}"
 echo
 
 cd "$DSH_WORKSPACE"
-exec dsh web --no-open --port "$DSH_PORT" \
-  --patch "$CONFIG_DIR/webserver.cordis.yml" \
-  --patch "$CONFIG_DIR/llm.cordis.yml" \
-  --trusted-host "$DSH_TRUSTED_HOST"
+exec "${CMD[@]}"
