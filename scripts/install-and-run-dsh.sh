@@ -47,17 +47,19 @@ DSH_PLUGINS_STRICT="${DSH_PLUGINS_STRICT:-0}"
 DSH_PROFILE="${DSH_PROFILE:-web}"
 
 # npm / git install specs (user-facing names → real packages)
-# - dsh-document  → @jiaoqsh/dsh-document
-# - dsh-auth-gate → dsh-auth-gate
-# - dsh-docs      → dsh-doc  (npm; repo Sqhao-O/dsh-docs — stub package "dsh-docs" is empty)
-# - dsh-open-file → dsh-open-file
-# - dsh-chat-files→ github:xzyonline/dsh-file-attachments (not published to npm)
+# - dsh-document       → @jiaoqsh/dsh-document
+# - dsh-auth-gate      → dsh-auth-gate
+# - dsh-docs           → dsh-doc  (npm; repo Sqhao-O/dsh-docs — stub package "dsh-docs" is empty)
+# - dsh-open-file      → dsh-open-file
+# - dsh-chat-files     → github:xzyonline/dsh-file-attachments (not published to npm)
+# - DSH-better-sidebar → dsh-better-sidebar
 DEFAULT_PLUGINS=(
   "@jiaoqsh/dsh-document"
   "dsh-auth-gate"
   "dsh-doc"
   "dsh-open-file"
   "github:xzyonline/dsh-file-attachments"
+  "dsh-better-sidebar"
 )
 
 if [[ -z "${DSH_TRUSTED_HOST:-}" ]]; then
