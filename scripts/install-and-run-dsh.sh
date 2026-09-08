@@ -104,28 +104,54 @@ write_if_changed() {
 }
 
 dsh_installed_version() {
-  local bin ver
-  bin="$(command -v dsh 2>/dev/null || true)"
-  [[ -n "$bin" ]] || return 1
-  ver="$("$bin" --version 2>/dev/null | head -n1 || true)"
-  ver="${ver#v}"
-  # Prefer exact npm global version when available.
-  local npm_ver
-  npm_ver="$(npm list -g --depth=0 --json '@deepseek-ai/dsh' 2>/dev/null \
-    | python3 -c 'import json,sys
-try:
- d=json.load(sys.stdin)
- print(((d.get("dependencies") or {}).get("@deepseek-ai/dsh") or {}).get("version") or "")
-except Exception:
- print("")' 2>/dev/null || true)"
-  if [[ -n "$npm_ver" ]]; then
-    printf '%s\n' "$npm_ver"
+  local pkg ver bin real dir candidates=()
+  candidates+=("$HOME/.npm-global/lib/node_modules/@deepseek-ai/dsh/package.json")
+  if command -v dsh >/dev/null 2>&1; then
+    bin="$(command -v dsh)"
+    real="$(readlink -f "$bin" 2>/dev/null || readlink "$bin" 2>/dev/null || printf '%s' "$bin")"
+    dir="$(dirname "$real")"
+    candidates+=("$(cd "$dir/.." 2>/dev/null && pwd)/lib/node_modules/@deepseek-ai/dsh/package.json")
+  fi
+  # Only ask npm if local paths miss (npm root -g is usually fast; avoid `npm list`).
+  for pkg in "${candidates[@]}"; do
+    [[ -n "$pkg" && -f "$pkg" ]] || continue
+    ver="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("version",""))' "$pkg" 2>/dev/null || true)"
+    if [[ -n "$ver" ]]; then
+      printf '%s\n' "$ver"
+      return 0
+    fi
+  done
+  local root
+  root="$(npm root -g 2>/dev/null || true)"
+  if [[ -n "$root" && -f "$root/@deepseek-ai/dsh/package.json" ]]; then
+    ver="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],encoding="utf-8")).get("version",""))' "$root/@deepseek-ai/dsh/package.json" 2>/dev/null || true)"
+    if [[ -n "$ver" ]]; then
+      printf '%s\n' "$ver"
+      return 0
+    fi
+  fi
+  if command -v dsh >/dev/null 2>&1; then
+    ver="$(dsh --version 2>/dev/null | head -n1 || true)"
+    ver="${ver#v}"
+    ver="$(printf '%s\n' "$ver" | grep -oE '[0-9][0-9A-Za-z._+-]*' | head -n1 || true)"
+    [[ -n "$ver" ]] || return 1
+    printf '%s\n' "$ver"
     return 0
   fi
-  [[ -n "$ver" ]] || return 1
-  # Strip trailing junk; keep first token that looks like a version.
-  printf '%s\n' "$ver" | grep -oE '[0-9][0-9A-Za-z._+-]*' | head -n1
+  return 1
 }
+
+npm_install_g() {
+  local pkg="$1"
+  info "running: npm install -g $pkg (no-audit/no-fund; may take a minute)"
+  # Never hang forever on a stuck registry/npm lock.
+  if command -v timeout >/dev/null 2>&1; then
+    timeout --foreground 180 npm install -g "$pkg" --no-audit --no-fund --fetch-retries=2 --fetch-retry-maxtimeout=20000
+  else
+    npm install -g "$pkg" --no-audit --no-fund --fetch-retries=2 --fetch-retry-maxtimeout=20000
+  fi
+}
+
 
 plugin_spec_name() {
   local spec="$1"
@@ -422,26 +448,29 @@ else
 fi
 
 log "Step 3/9: install @deepseek-ai/dsh@${DSH_VERSION} and pnpm"
+info "checking already-installed dsh (filesystem; not npm list)…"
 INSTALLED_DSH_VER="$(dsh_installed_version || true)"
+if [[ -n "$INSTALLED_DSH_VER" ]]; then
+  info "found dsh@$INSTALLED_DSH_VER"
+fi
 if [[ "$DSH_FORCE" != "1" && -n "$INSTALLED_DSH_VER" && "$INSTALLED_DSH_VER" == "$DSH_VERSION" ]]; then
   info "dsh@$INSTALLED_DSH_VER already installed — skip npm install -g"
 else
   if [[ -n "$INSTALLED_DSH_VER" && "$INSTALLED_DSH_VER" != "$DSH_VERSION" ]]; then
     info "dsh@$INSTALLED_DSH_VER present → upgrading to @$DSH_VERSION"
   else
-    info "installing @deepseek-ai/dsh@$DSH_VERSION"
+    info "dsh not found at @$DSH_VERSION — installing"
   fi
-  npm install -g "@deepseek-ai/dsh@${DSH_VERSION}"
+  npm_install_g "@deepseek-ai/dsh@${DSH_VERSION}" || die "npm install -g @deepseek-ai/dsh@$DSH_VERSION failed or timed out (180s). Check network/registry or: npm install -g @deepseek-ai/dsh@$DSH_VERSION"
 fi
 if command -v pnpm >/dev/null 2>&1 && [[ "$DSH_FORCE" != "1" ]]; then
   info "pnpm already present — skip"
 else
   if ! command -v pnpm >/dev/null 2>&1; then
-    info "installing pnpm (required by: dsh plugin)"
-    npm install -g pnpm
+    npm_install_g pnpm || die "npm install -g pnpm failed or timed out"
   elif [[ "$DSH_FORCE" == "1" ]]; then
     info "DSH_FORCE=1 — reinstalling pnpm"
-    npm install -g pnpm
+    npm_install_g pnpm || die "npm install -g pnpm failed or timed out"
   fi
 fi
 DSH_BIN="$(command -v dsh || true)"
